@@ -1,227 +1,134 @@
 # Claude Code → Codex 自动 Review（Hook 脚本包）
 
-目标：
-- Claude Code 在一次会话里改完代码后（Stop），自动调用 Codex CLI 做一次 review。
-- 不依赖 `git commit`。
-- 只 review「本次会话里 Claude 触碰过的文件」的 diff（避免把历史脏 diff 混进来）。
-- **每个 session 只 review 一次**（避免 Stop 多次触发导致重复 review）。
+这套方案的目标是：Claude Code 在一次会话里改完代码后（Stop），自动调用 Codex CLI 做一次 review，且只 review「本次会话里 Claude 触碰过的文件」。
+
+为了解决 Claude Code 在 Windows 上按原文 Bash 方案容易遇到的兼容性问题（bash/mktemp/python3/chmod 等），这里推荐使用纯 Python 版本（跨平台，不依赖 bash）。
 
 ---
 
-## 你需要改动/新增的文件
+## 前置条件
 
-### 1) 项目配置：`.claude/settings.json`
+- 项目是 git 仓库（`git rev-parse --is-inside-work-tree` 能通过）
+- 本机可用：`python`、`git`、`codex`（并且 `codex login` 已完成）
+- Claude Code hooks 会把 hook 事件 JSON 通过 stdin 传给脚本
+
+---
+
+## 文件清单
+
+### 1) 配置：`.claude/settings.json`（把下面片段合并进去）
+
+每个人项目的 `.claude/settings.json` 往往已经有自己的配置（hooks / permissions 等），所以这里**不建议整文件覆盖**。
+你只需要把下面两个 hook 片段按需追加到你现有的 `hooks.PostToolUse` 和 `hooks.Stop` 数组里即可（没有就创建）。
+
+PostToolUse：追加到 `hooks.PostToolUse`：
 
 ```json
 {
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Write|Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/record_touched_files.sh"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/codex_review_touched_once.sh",
-            "timeout": 180
-          }
-        ]
-      }
-    ]
-  }
+  "matcher": "Write|Edit",
+  "hooks": [
+    {
+      "type": "command",
+      "command": "python .claude/hooks/record_touched_files.py"
+    }
+  ]
 }
 ```
 
-> 说明：
-> - `PostToolUse` 只对 `Write|Edit` 触发：记录被改的文件。
-> - `Stop` 触发：收集本 session 的 touched files，拼 diff，调用 `codex exec`。
+Stop：追加到 `hooks.Stop`：
 
----
-
-### 2) 新增脚本：`.claude/hooks/record_touched_files.sh`
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Claude Code 会把 hook 事件 JSON 从 stdin 传进来。
-# 这里解析 session_id + tool_input.file_path，把被触碰的文件记录到：
-#   .claude/.codex_review/files_<session_id>.txt
-
-python3 - <<'PY'
-import json, os, pathlib, sys
-
-data = json.load(sys.stdin)
-sid = data.get("session_id")
-tool = data.get("tool_name")
-inp = data.get("tool_input") or {}
-fp = inp.get("file_path")
-
-if not sid or tool not in ("Write","Edit") or not fp:
-    sys.exit(0)
-
-proj = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-
-# 规范化路径：尽量存相对路径，便于 git diff -- <files>
-if os.path.isabs(fp):
-    rel = os.path.relpath(fp, proj)
-else:
-    rel = fp
-rel = os.path.normpath(rel)
-
-out_dir = pathlib.Path(proj) / ".claude" / ".codex_review"
-out_dir.mkdir(parents=True, exist_ok=True)
-
-lst = out_dir / f"files_{sid}.txt"
-
-existing = set()
-if lst.exists():
-    existing = set(x.strip() for x in lst.read_text(encoding="utf-8").splitlines() if x.strip())
-
-if rel not in existing:
-    with lst.open("a", encoding="utf-8") as f:
-        f.write(rel + "\n")
-PY
-```
-
----
-
-### 3) 新增脚本：`.claude/hooks/codex_review_touched_once.sh`
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Stop hook JSON 从 stdin 读取。
-# 我们用 session_id 做“只跑一次”的哨兵文件：
-#   .claude/.codex_review/done_<session_id>
-
-SID="$(python3 - <<'PY'
-import json, sys
-print((json.load(sys.stdin) or {}).get("session_id", ""))
-PY
-)"
-
-# 没有 session_id 就不执行（保险）
-[[ -n "$SID" ]] || exit 0
-
-cd "${CLAUDE_PROJECT_DIR:-.}"
-
-# 必须是 git 仓库
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
-
-STATE_DIR=".claude/.codex_review"
-mkdir -p "$STATE_DIR"
-
-DONE_FILE="$STATE_DIR/done_${SID}"
-LIST_FILE="$STATE_DIR/files_${SID}.txt"
-
-# 只 review 一次：如果 done 文件存在，直接退出
-if [[ -f "$DONE_FILE" ]]; then
-  exit 0
-fi
-
-# 没有记录到 touched files，就不 review
-[[ -s "$LIST_FILE" ]] || exit 0
-
-# 读文件列表
-mapfile -t FILES < "$LIST_FILE"
-
-# 过滤掉空行
-FILTERED=()
-for f in "${FILES[@]}"; do
-  [[ -n "${f// }" ]] && FILTERED+=("$f")
-done
-FILES=("${FILTERED[@]}")
-
-[[ ${#FILES[@]} -gt 0 ]] || exit 0
-
-# touched files 在 staged/unstaged 都没变化，就不 review
-if git diff --quiet -- "${FILES[@]}" && git diff --cached --quiet -- "${FILES[@]}"; then
-  exit 0
-fi
-
-# 输出目录
-OUT_DIR=".claude/reports"
-mkdir -p "$OUT_DIR"
-OUT_FILE="$OUT_DIR/codex_review_${SID}.md"
-
-# 生成 review prompt（把 diff 塞给 Codex）
-TMP_PROMPT="$(mktemp)"
+```json
 {
-  echo "You are a senior engineer performing a PR-style code review."
-  echo "Focus on: correctness, security, edge cases, performance, maintainability."
-  echo "Return: (1) Top risks (2) Concrete suggestions (3) Quick wins."
-  echo ""
-  echo "## STAGED DIFF (only touched files)"
-  git --no-pager diff --cached --unified=5 -- "${FILES[@]}" || true
-  echo ""
-  echo "## UNSTAGED DIFF (only touched files)"
-  git --no-pager diff --unified=5 -- "${FILES[@]}" || true
-} > "$TMP_PROMPT"
-
-# 调 Codex：只读审查 + 把最终输出落盘
-# 依赖：codex 在 PATH 里
-codex exec --sandbox read-only --output-last-message "$OUT_FILE" - < "$TMP_PROMPT"
-
-# 标记 done：保证同 session 后续 Stop 不再重复 review
-: > "$DONE_FILE"
-
-# 清理临时文件（保留 OUT_FILE 和 DONE_FILE，便于你回看/排查）
-rm -f "$TMP_PROMPT" "$LIST_FILE"
-
-# 在终端打印摘要（可删）
-echo ""
-echo "===== Codex Review (session $SID) ====="
-cat "$OUT_FILE"
-echo "======================================="
+  "hooks": [
+    {
+      "type": "command",
+      "command": "python .claude/hooks/codex_review_touched_once.py",
+      "timeout": 180
+    }
+  ]
+}
 ```
+
+说明：
+- `PostToolUse`：仅对 `Write|Edit` 触发，记录本 session 触碰的文件列表
+- `Stop`：把 touched files 的 diff 拼成 prompt，调用 `codex exec` 做 review
+
+提示：如果你的环境只有 `python3`，把命令里的 `python` 改成 `python3` 即可。
 
 ---
 
-### 4) 权限
+### 2) PostToolUse：`.claude/hooks/record_touched_files.py`
 
-```bash
-chmod +x .claude/hooks/record_touched_files.sh
-chmod +x .claude/hooks/codex_review_touched_once.sh
-```
+作用：收到 `Write|Edit` 事件后，把本次 session 触碰到的文件记录到：
+
+- `.claude/.codex_review/files_<session_id>.txt`
+
+细节：
+- 尽量保存为“项目内相对路径”（方便 `git diff -- <files>`）
+- 会忽略项目外路径（例如 `..\\..\\something`）
 
 ---
 
-## 建议加到 .gitignore（可选）
+### 3) Stop：`.claude/hooks/codex_review_touched_once.py`
 
-避免把本地报告/状态文件提交进去：
+作用：
+
+- 同一 `session_id` 下只执行一次（哨兵文件：`.claude/.codex_review/done_<session_id>`）
+- 读取 `.claude/.codex_review/files_<session_id>.txt`
+- 对这些文件的 staged/unstaged diff 生成 prompt
+- 调用：
+  - `codex exec --sandbox read-only --output-last-message <report.md> -`
+- 输出文件：
+  - 成功：`.claude/reports/codex_review_<session_id>.md`
+  - 失败：`.claude/reports/codex_review_<session_id>.error.log`
+
+---
+
+## 建议加到 `.gitignore`（可选）
+
+把下面几行追加到你的项目 `.gitignore`（避免把本地报告/状态文件提交进仓库）：
 
 ```gitignore
 # Claude/Codex automation
 .claude/reports/
 .claude/.codex_review/
+.claude/.codex_home/
+.claude/settings.local.json
 ```
 
 ---
 
-## 快速自检（排查不触发/不执行）
+## 快速自检 / 排查
 
-1) **先确认 Stop hook 能触发**（不接 Codex）：
+### PowerShell 手动模拟（可选）
 
-把 `.claude/settings.json` 的 Stop command 临时替换成：
+用于在不启动 Claude Code 的情况下，直接模拟 hook stdin JSON 输入，快速验证脚本工作流。
+
+```powershell
+$env:CLAUDE_PROJECT_DIR = (Get-Location).Path
+
+# 模拟 PostToolUse(Write)
+$write = @{session_id='manual_ps1'; tool_name='Write'; tool_input=@{file_path='test_file.txt'}} | ConvertTo-Json -Compress
+$write | python .claude/hooks/record_touched_files.py
+
+# 模拟 Stop（dry run：只生成 prompt，不调用 codex）
+$env:CODEX_REVIEW_DRY_RUN = '1'
+$stop = @{session_id='manual_ps1'} | ConvertTo-Json -Compress
+$stop | python .claude/hooks/codex_review_touched_once.py
+
+# 查看生成的 prompt
+Get-Content -LiteralPath .claude/reports/codex_review_manual_ps1.prompt.txt -Raw
+```
+
+1) 先确认 Stop hook 能触发（不接 Codex）：
+
+把 `.claude/settings.json` 的 Stop command 临时改成：
 
 ```json
 "command": "echo '[claude stop hook fired]'"
 ```
 
-只要 Claude Code 回复一次，你就应该看到输出。
-
-2) **确认 codex 可被脚本调用**：
+2) 确认 codex 可用：
 
 ```bash
 codex exec --sandbox read-only - <<'EOF'
@@ -229,30 +136,24 @@ Say hello in one sentence.
 EOF
 ```
 
-3) **确认 touched files 记录正常**：
+3) Dry run（不调用 Codex，只把 prompt 落盘，便于核对 diff/文件收集）：
 
-在 Claude Code 里让它改一个文件，然后看：
-
-```bash
-ls -la .claude/.codex_review/
-cat .claude/.codex_review/files_*.txt
-```
+- 给 Stop hook 临时加环境变量：`CODEX_REVIEW_DRY_RUN=1`
+- 运行后会在 `.claude/reports/` 下生成：`codex_review_<sid>.prompt.txt`
 
 ---
 
-## 可调整项（按你的习惯）
+## 可调项（可选，环境变量）
 
-- 只 review staged：把脚本里 UNSTAGED DIFF 那段删掉即可。
-- review 太慢：把 diff 的 `--unified=5` 改小，或只传 staged。
-- 想让输出更“可机器处理”：在 `codex exec` 上加 `--output-schema`，让它输出 JSON（你再加工）。
+- `CODEX_REVIEW_TIMEOUT_SECONDS`：默认 180
+- `CODEX_REVIEW_UNIFIED`：默认 5（git diff 上下文行）
+- `CODEX_REVIEW_MAX_PROMPT_CHARS`：默认 200000（diff 太大时会截断并提示）
 
 ---
 
-## 你只需要做的事
+## 常见报错（经验）
 
-1. 新建目录：`.claude/hooks/`
-2. 按上述内容新增两个脚本
-3. 写入 `.claude/settings.json`
-4. `chmod +x`
-5. 运行 Claude Code，让它改动一个文件，结束后看终端是否出现 Codex Review 输出，以及 `.claude/reports/codex_review_<sid>.md`
+- `python3` / `bash` / `mktemp` / `chmod` 不存在：不要用 Bash 方案，直接用本文的 Python 方案。
+- `Codex cannot access session files at ...\\.codex\\sessions (permission denied)`：通常是 `~/.codex` 权限/归属异常导致；需要修复用户目录权限或重新初始化 Codex。
+- `network error`：Codex 调用 API 需要网络；失败时查看 `.claude/reports/codex_review_<sid>.error.log`。
 

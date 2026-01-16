@@ -1,0 +1,7 @@
+# Claude/Codex automation
+.claude/reports/
+.claude/.codex_review/
+.claude/.codex_home/
+
+# Local-only settings (optional)
+.claude/settings.local.json
